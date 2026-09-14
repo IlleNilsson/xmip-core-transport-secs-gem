@@ -32,6 +32,7 @@ pub use connection::Connection;
 pub use hsms::{Header, Message, SType};
 pub use item::Item;
 use transport::error::{Result, protocol_error};
+use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
@@ -177,21 +178,9 @@ impl SecsGemTransport {
     }
 }
 
-/// The bound passive side waiting for the one host that sends one data
-/// message.
-struct Listening {
-    transport: SecsGemTransport,
-    listener: TcpListener,
-    address: String,
-}
-
-impl FarEnd for Listening {
-    fn address(&self) -> &str {
-        &self.address
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        let mut connection = self.transport.accept_one(&self.listener)?;
+impl Accepting for SecsGemTransport {
+    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+        let mut connection = self.accept_one(listener)?;
         let message = connection
             .next_data()?
             .ok_or_else(|| protocol_error("the host separated without a message"))?;
@@ -205,11 +194,7 @@ impl FarEnd for Listening {
 impl Loopback for SecsGemTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening {
-            transport: self.clone(),
-            listener,
-            address,
-        }))
+        Ok(Box::new(Listening::new(self.clone(), listener, address)))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
@@ -223,20 +208,10 @@ impl Loopback for SecsGemTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::payload::edge_payloads;
 
     fn node() -> SecsGemTransport {
         SecsGemTransport::new("127.0.0.1:0").timing_out_after(Duration::from_secs(2))
-    }
-
-    fn edges() -> Vec<(&'static str, Vec<u8>)> {
-        vec![
-            ("empty", Vec::new()),
-            ("one byte", vec![0x2a]),
-            ("every byte", (0..=255).collect()),
-            ("nul run", vec![0; 512]),
-            ("high bytes", vec![0xff; 512]),
-            ("crlf storm", b"\r\n".repeat(400)),
-        ]
     }
 
     #[test]
@@ -263,7 +238,7 @@ mod tests {
     fn the_loopback_returns_the_edge_payloads_whole() {
         let transport = SecsGemTransport::loopback();
         assert!(transport.ceiling().is_none());
-        for (name, bytes) in edges() {
+        for (name, bytes) in edge_payloads() {
             assert!(transport.refuses(&bytes).is_none(), "{name}");
             let arrived = transport
                 .round(&bytes)
