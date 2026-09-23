@@ -181,11 +181,7 @@ fn split<const N: usize>(data: &[u8]) -> Result<impl Iterator<Item = [u8; N]> + 
             data.len()
         )));
     }
-    Ok(data.chunks_exact(N).map(|chunk| {
-        let mut value = [0u8; N];
-        value.copy_from_slice(chunk);
-        value
-    }))
+    Ok(data.as_chunks::<N>().0.iter().copied())
 }
 
 #[cfg(test)]
