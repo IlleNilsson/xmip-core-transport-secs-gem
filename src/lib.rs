@@ -179,7 +179,7 @@ impl SecsGemTransport {
 }
 
 impl Accepting for SecsGemTransport {
-    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
         let mut connection = self.accept_one(listener)?;
         let message = connection
             .next_data()?
@@ -193,8 +193,7 @@ impl Accepting for SecsGemTransport {
 
 impl Loopback for SecsGemTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening::new(self.clone(), listener, address)))
+        Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
