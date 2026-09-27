@@ -32,6 +32,7 @@ pub use connection::Connection;
 pub use hsms::{Header, Message, SType};
 pub use item::Item;
 use transport::error::{Result, protocol_error};
+use transport::kept::Kept;
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
@@ -44,6 +45,8 @@ pub struct SecsGemTransport {
     session_id: u16,
     wait: bool,
     timeout: Option<Duration>,
+    /// The listener the first receive binds, and every receive takes from.
+    receiving: Kept<TcpListener>,
 }
 
 impl SecsGemTransport {
@@ -58,6 +61,7 @@ impl SecsGemTransport {
             session_id: connection::ANY_SESSION,
             wait: false,
             timeout: None,
+            receiving: Kept::new(),
         }
     }
 
@@ -145,10 +149,11 @@ impl Transport for SecsGemTransport {
         Directions::BOTH
     }
 
-    /// One equipment's data messages until it separates.
+    /// One equipment's data messages until it separates, from the listener
+    /// the first receive bound and kept.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let (listener, _) = self.bind()?;
-        let mut connection = self.accept_one(&listener)?;
+        let listener = self.receiving.bound(|| self.bind())?;
+        let mut connection = self.accept_one(listener)?;
         let mut arrived = Vec::new();
         while let Some(message) = connection.next_data()? {
             arrived.push(Arrived::new(
@@ -264,6 +269,16 @@ mod tests {
 
     fn node() -> SecsGemTransport {
         SecsGemTransport::new("127.0.0.1:0").timing_out_after(Duration::from_secs(2))
+    }
+
+    #[test]
+    fn every_receive_takes_from_the_listener_the_first_bound() {
+        let receiver = SecsGemTransport::loopback();
+        receiver.receiving.bound(|| receiver.bind()).expect("bound");
+        let address = receiver.receiving.address().expect("address");
+        transport::kept::held_across_receives(&receiver, address, 5, |at, payload| {
+            SecsGemTransport::loopback().send_to(at, payload)
+        });
     }
 
     #[test]
