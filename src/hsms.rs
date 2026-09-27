@@ -10,12 +10,12 @@
 
 use std::io::{Read, Write};
 
+use net::MAX_BODY;
+use transport::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// The header, always.
 pub const HEADER_LEN: usize = 10;
-/// The most a message may say it is before it is refused.
-pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 /// Session type: what kind of message the header is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,7 +165,7 @@ pub fn write_message(writer: &mut impl Write, message: &Message) -> Result<()> {
 /// Read one message, or `None` when the peer closed between messages.
 ///
 /// # Errors
-/// A length shorter than the header or over [`MAX_MESSAGE`], a session type
+/// A length shorter than the header or over `net::MAX_BODY`, a session type
 /// E37 does not define, or a connection that closes mid-message.
 pub fn read_message(reader: &mut impl Read) -> Result<Option<Message>> {
     let mut length = [0u8; 4];
@@ -182,9 +182,7 @@ pub fn read_message(reader: &mut impl Read) -> Result<Option<Message>> {
     if length < HEADER_LEN {
         return Err(protocol_error("an HSMS message shorter than its header"));
     }
-    if length > MAX_MESSAGE {
-        return Err(protocol_error("an HSMS message over what Xmip will read"));
-    }
+    ceiling::within(length, MAX_BODY, "Xmip reads in one message")?;
     let mut bytes = vec![0u8; length];
     reader
         .read_exact(&mut bytes)
