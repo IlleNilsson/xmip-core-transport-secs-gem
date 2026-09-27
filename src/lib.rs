@@ -35,7 +35,8 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 #[derive(Clone)]
 pub struct SecsGemTransport {
@@ -168,6 +169,58 @@ impl Transport for SecsGemTransport {
     }
 }
 
+impl Configured for SecsGemTransport {
+    /// The address is where a Receive Location listens as the passive side,
+    /// `0.0.0.0:5000`; a Send Location's target is each send's own.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "session",
+                kind: Kind::Integer {
+                    minimum: 0,
+                    maximum: 65_535,
+                },
+                presence: Presence::Default(Fixed::Integer(connection::ANY_SESSION as i64)),
+                meaning: "The session id, the device id, a Send Location selects under.",
+                applies: Applies::Send,
+            },
+            Setting {
+                name: "wait",
+                kind: Kind::Boolean,
+                presence: Presence::Optional,
+                meaning: "Whether what is sent sets the wait bit and takes the reply, unless the \
+                          target says `wait=0`; no reply is waited for when left out.",
+                applies: Applies::Send,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a peer that stops mid-message or never replies is waited on; \
+                          unbounded when left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let mut transport = Self::new(address);
+        if let Some(session) = settings.optional_integer("session") {
+            let session = u16::try_from(session)
+                .map_err(|_| protocol_error("the session id is out of range"))?;
+            transport = transport.with_session(session);
+        }
+        if settings.optional_boolean("wait") == Some(true) {
+            transport = transport.awaiting_reply();
+        }
+        if let Some(timeout) = settings.optional_duration("timeout") {
+            transport = transport.timing_out_after(timeout);
+        }
+        Ok(transport)
+    }
+}
+
 impl SecsGemTransport {
     /// Both ends on this machine: an ephemeral local port for the passive
     /// side, the loopback timeout on every read. The near end sends the
@@ -211,6 +264,28 @@ mod tests {
 
     fn node() -> SecsGemTransport {
         SecsGemTransport::new("127.0.0.1:0").timing_out_after(Duration::from_secs(2))
+    }
+
+    #[test]
+    fn secs_gem_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(SecsGemTransport::SETTINGS.problems(), Vec::<String>::new());
+        let given = [
+            ("session".to_string(), Given::Integer(7)),
+            ("wait".to_string(), Given::Boolean(true)),
+            ("timeout".to_string(), Given::Text("2s".to_string())),
+        ];
+        let built = SecsGemTransport::open("0.0.0.0:0", Applies::Send, &given).expect("sent");
+        assert_eq!(built.session_id, 7);
+        assert!(built.wait);
+        assert_eq!(built.timeout, Some(Duration::from_secs(2)));
+        let plain = SecsGemTransport::open("0.0.0.0:0", Applies::Send, &[]).expect("plain");
+        assert_eq!(plain.session_id, connection::ANY_SESSION);
+        assert!(!plain.wait);
+        let Err(refused) = SecsGemTransport::open("0.0.0.0:0", Applies::Receive, &given) else {
+            panic!("a Receive Location selects nothing");
+        };
+        assert!(refused.message.contains("\"session\""), "{refused}");
     }
 
     #[test]
