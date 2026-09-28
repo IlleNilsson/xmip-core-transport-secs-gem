@@ -31,6 +31,7 @@ use std::time::Duration;
 pub use connection::Connection;
 pub use hsms::{Header, Message, SType};
 pub use item::Item;
+use net::Target;
 use transport::error::{Result, protocol_error};
 use transport::kept::Kept;
 use transport::listening::{Accepting, Listening};
@@ -67,7 +68,7 @@ impl SecsGemTransport {
 
     /// The session id — the device id — a select is made under.
     #[must_use]
-    pub const fn with_session(mut self, session_id: u16) -> Self {
+    const fn with_session(mut self, session_id: u16) -> Self {
         self.session_id = session_id;
         self
     }
@@ -75,7 +76,7 @@ impl SecsGemTransport {
     /// Set the wait bit on what is sent and take the reply, unless the
     /// target says `wait=0`.
     #[must_use]
-    pub const fn awaiting_reply(mut self) -> Self {
+    const fn awaiting_reply(mut self) -> Self {
         self.wait = true;
         self
     }
@@ -119,24 +120,22 @@ impl SecsGemTransport {
     /// # Errors
     /// A stream, function or wait in the query that is not a number.
     pub fn resolve(&self, target: &str) -> Result<(String, u8, u8, bool)> {
-        let Some((authority, _)) = socket::target("secs-gem", target) else {
+        let Some(named) = Target::under(&["secs-gem"], target) else {
             return Ok((target.to_string(), 6, 11, self.wait));
         };
-        let (address, query) = authority.split_once('?').unwrap_or((authority, ""));
         let (mut stream, mut function, mut wait) = (6u8, 11u8, self.wait);
-        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        for (key, value) in named.query() {
             let number: u8 = value
                 .parse()
                 .map_err(|_| protocol_error(format!("{key}={value:?} is not a number")))?;
-            match key {
+            match key.as_str() {
                 "stream" => stream = number,
                 "function" => function = number,
                 "wait" => wait = number != 0,
                 _ => {}
             }
         }
-        Ok((address.to_string(), stream, function, wait))
+        Ok((named.authority().to_string(), stream, function, wait))
     }
 }
 
