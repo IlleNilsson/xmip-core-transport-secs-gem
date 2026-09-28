@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 
 use net::MAX_BODY;
-use transport::ceiling;
+use net::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// The header, always.
