@@ -20,25 +20,60 @@
 //! `secs-gem://peer?session=1&stream=6&function=11`. A target is
 //! `secs-gem://host:5000?stream=6&function=11&wait=1`, S6F11 without a
 //! query, or a bare `host:port`.
+//!
+//! **How a receive acknowledges.** A primary with the wait bit set is
+//! answered after the whole receive cycle, on the connection it came on:
+//! [`Verdict::Accepted`] replies under the next function up with
+//! [`ACCEPTED`], `<B 0>`, the code SECS-II's acknowledge items share for
+//! accepted; [`Verdict::Refused`] replies under the next function up with
+//! [`NOT_ACCEPTED`], `<B 1>`, the code those items give a message received
+//! and not accepted (SEMI E5, section 10, the data item dictionary: ACKC5,
+//! ACKC6 *1–63 error, not accepted*), so the equipment does not send it
+//! again; [`Verdict::Failed`] replies `SxF0`, the abort SEMI E5 (section
+//! 9.2, function 0) gives a receiver that will not complete the
+//! transaction, so the equipment sends it again. A receive stops at such a
+//! primary and keeps the connection, so the next receive goes on reading it
+//! once the reply is written. A message
+//! without the wait bit expects nothing back: acceptance is at-most-once
+//! there ([`AT_MOST_ONCE`]). Each message arrives whole.
 
 pub mod connection;
 pub mod hsms;
 pub mod item;
 
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 pub use connection::Connection;
 pub use hsms::{Header, Message, SType};
 pub use item::Item;
 use net::Target;
-use transport::error::{Result, protocol_error};
+use transport::error::{Result, TransportError, protocol_error};
 use transport::kept::Kept;
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
+use transport::{Acknowledgement, Taken, Verdict};
 use transport::{Arrived, Configured, Directions, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// The body of the reply to an accepted primary: `<B 0>`, accepted, the
+/// code ACKC5, ACKC6, ACKC10, HCACK and the other acknowledge items share.
+pub const ACCEPTED: [u8; 3] = [0x21, 0x01, 0x00];
+
+/// The body of the reply to a refused primary: `<B 1>`, error, not
+/// accepted, the first of the codes 1–63 the acknowledge items give a
+/// message the receiver will not take.
+pub const NOT_ACCEPTED: [u8; 3] = [0x21, 0x01, 0x01];
+
+/// Why a message without the wait bit cannot be acknowledged after the
+/// receive cycle.
+pub const AT_MOST_ONCE: &str = "a SECS-II message without the wait bit expects no reply, so the \
+                                equipment is never told how the receive cycle ended";
+
+/// The connection a receive stopped on, its primary waiting for a reply.
+type Open = Arc<Mutex<Option<Connection>>>;
 
 #[derive(Clone)]
 pub struct SecsGemTransport {
@@ -48,6 +83,9 @@ pub struct SecsGemTransport {
     timeout: Option<Duration>,
     /// The listener the first receive binds, and every receive takes from.
     receiving: Kept<TcpListener>,
+    /// The connection a receive stopped on at a waiting primary, which the
+    /// verdict replies on and the next receive goes on reading.
+    open: Open,
 }
 
 impl SecsGemTransport {
@@ -63,6 +101,7 @@ impl SecsGemTransport {
             wait: false,
             timeout: None,
             receiving: Kept::new(),
+            open: Open::default(),
         }
     }
 
@@ -148,29 +187,87 @@ impl Transport for SecsGemTransport {
         Directions::BOTH
     }
 
-    /// One equipment's data messages until it separates, from the listener
-    /// the first receive bound and kept.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered("the connection is held by the message waiting for its reply")
+    }
+
+    /// One equipment's data messages until it separates, or up to the first
+    /// primary with the wait bit: from the connection the last receive
+    /// stopped on, or one accepted on the listener the first receive bound
+    /// and kept. A waiting primary is answered after the cycle — `<B 0>` on
+    /// accepted, `<B 1>` on refused, `SxF0` on failed — and the receive
+    /// stops at it, keeping
+    /// the connection for the next. A message without the wait bit is
+    /// at-most-once ([`AT_MOST_ONCE`]).
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let listener = self.receiving.bound(|| self.bind())?;
-        let mut connection = self.accept_one(listener)?;
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut connection = match open.take() {
+            Some(connection) => connection,
+            None => self.accept_one(self.receiving.bound(|| self.bind())?)?,
+        };
         let mut arrived = Vec::new();
         while let Some(message) = connection.next_data()? {
-            arrived.push(Arrived::new(
-                connection.origin(&message.header),
-                message.body,
-            ));
+            let origin = connection.origin(&message.header);
+            if message.header.wait {
+                let acknowledgement = replied(Arc::clone(&self.open), message.header);
+                arrived.push(Arrived::whole(origin, message.body, acknowledgement));
+                *open = Some(connection);
+                return Ok(arrived);
+            }
+            let acknowledgement = Acknowledgement::at_most_once(AT_MOST_ONCE);
+            arrived.push(Arrived::whole(origin, message.body, acknowledgement));
         }
         Ok(arrived)
     }
 
     /// Connect, select, send one message, take the reply if one is due,
-    /// separate.
+    /// separate. A reply under function 0 — the equipment aborted the
+    /// transaction — fails the send as retryable; a reply that is a single
+    /// non-zero acknowledge code — not accepted — fails it as permanent.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (address, stream, function, wait) = self.resolve(target)?;
         let mut connection = self.connect(&address)?;
-        connection.send_data(stream, function, wait, bytes)?;
-        connection.separate()
+        let reply = connection.send_data(stream, function, wait, bytes)?;
+        connection.separate()?;
+        match reply {
+            Some(reply) if reply.header.function == 0 => Err(TransportError::retryable(format!(
+                "the equipment aborted S{stream}F{function} with S{stream}F0"
+            ))),
+            Some(reply) if matches!(reply.body[..], [0x21, 0x01, code] if code != 0) => {
+                Err(TransportError::permanent(format!(
+                    "the equipment did not accept S{stream}F{function}: code {}",
+                    reply.body[2]
+                )))
+            }
+            _ => Ok(()),
+        }
     }
+}
+
+/// The reply a waiting primary under `primary` gets once the cycle has
+/// ended, on the connection the receive kept: [`ACCEPTED`] or
+/// [`NOT_ACCEPTED`] under the next function up, or `SxF0`. The connection
+/// goes when the reply cannot be written.
+fn replied(open: Open, primary: Header) -> Acknowledgement {
+    Acknowledgement::deferred(move |verdict| {
+        let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
+        let connection = open
+            .as_mut()
+            .ok_or_else(|| protocol_error("the equipment's connection is gone"))?;
+        let primary_message = Message {
+            header: primary,
+            body: Vec::new(),
+        };
+        let written = match verdict {
+            Verdict::Accepted => connection.reply(&primary_message, &ACCEPTED),
+            Verdict::Refused(_) => connection.reply(&primary_message, &NOT_ACCEPTED),
+            Verdict::Failed => connection.abort(primary),
+        };
+        if written.is_err() {
+            open.take();
+        }
+        written
+    })
 }
 
 impl Configured for SecsGemTransport {
@@ -236,15 +333,18 @@ impl SecsGemTransport {
 }
 
 impl Accepting for SecsGemTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut connection = self.accept_one(listener)?;
         let message = connection
             .next_data()?
             .ok_or_else(|| protocol_error("the host separated without a message"))?;
+        if message.header.wait {
+            connection.reply(&message, &ACCEPTED)?;
+        }
         // See the Separate.req that follows, so the goodbye is read.
         connection.next_data()?;
         let origin = connection.origin(&message.header);
-        Ok(Arrived::new(origin, message.body))
+        Ok(Taken::new(origin, message.body))
     }
 }
 
@@ -402,6 +502,11 @@ mod tests {
         equipment.separate().expect("separate");
         let arrived = receiver.join().expect("thread").expect("receiving");
         assert_eq!(arrived.len(), 2);
+        assert!(!arrived[0].defers(), "no wait bit: at-most-once");
+        let arrived: Vec<Taken> = arrived
+            .into_iter()
+            .map(|one| one.taken().expect("taken"))
+            .collect();
         assert_eq!(arrived[0].bytes, b"first");
         assert!(
             arrived[0]
@@ -413,6 +518,47 @@ mod tests {
                 .origin_uri
                 .ends_with("?session=7&stream=5&function=1")
         );
+    }
+
+    #[test]
+    fn a_waiting_primary_is_not_accepted_when_refused_aborted_when_failed_and_acknowledged() {
+        let receiver = SecsGemTransport::loopback();
+        receiver.receiving.bound(|| receiver.bind()).expect("bound");
+        let address = receiver.receiving.address().expect("address");
+        let target = format!("secs-gem://{address}?stream=6&function=11&wait=1");
+        let host = std::thread::spawn(move || {
+            [b"R1", b"C1", b"C1"].map(|body| node().send(&target, body))
+        });
+        // Refused: S6F12 <B 1>, not accepted, and the send fails for good.
+        let mut arrived = receiver.receive().expect("the first");
+        assert_eq!(arrived.len(), 1);
+        assert!(arrived[0].defers(), "the wait bit waits for the verdict");
+        arrived
+            .remove(0)
+            .refused(transport::Refusal::Unacceptable)
+            .expect("not accepted");
+        // The kept connection goes on: the host separated after its reply.
+        assert!(receiver.receive().expect("separated").is_empty());
+        // Failed: the equipment's host is answered S6F0 and sends again.
+        let mut arrived = receiver.receive().expect("the second");
+        arrived.remove(0).failed().expect("aborted");
+        assert!(receiver.receive().expect("separated").is_empty());
+        // Accepted: S6F12 <B 0>, and the send succeeds.
+        let mut arrived = receiver.receive().expect("sent again");
+        let taken = arrived.remove(0).taken().expect("accepted");
+        assert_eq!(taken.bytes, b"C1");
+        let [refused, failed, accepted] = host.join().expect("thread");
+        let refused = refused.expect_err("not accepted");
+        assert!(
+            !refused.retryable && refused.message.contains("code 1"),
+            "{refused}"
+        );
+        let failed = failed.expect_err("aborted");
+        assert!(
+            failed.retryable && failed.message.contains("S6F0"),
+            "{failed}"
+        );
+        accepted.expect("acknowledged");
     }
 
     #[test]
