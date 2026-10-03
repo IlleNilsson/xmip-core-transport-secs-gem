@@ -154,6 +154,23 @@ impl Connection {
         })
     }
 
+    /// Abort the transaction `primary` opened: `SxF0`, header only, the
+    /// same system bytes — SEMI E5's answer from a receiver that will not
+    /// complete it.
+    ///
+    /// # Errors
+    /// Where the peer went away.
+    pub fn abort(&mut self, primary: Header) -> Result<()> {
+        self.write(&Message {
+            header: Header {
+                wait: false,
+                function: 0,
+                ..primary
+            },
+            body: Vec::new(),
+        })
+    }
+
     /// The next data message, or `None` when the peer separated, deselected
     /// or closed. Linktest requests are answered on the way.
     ///
