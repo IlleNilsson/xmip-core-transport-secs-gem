@@ -49,6 +49,7 @@ pub use connection::Connection;
 pub use hsms::{Header, Message, SType};
 pub use item::Item;
 use net::Target;
+use transport::ArrivalIdentity;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::kept::Kept;
 use transport::listening::{Accepting, Listening};
@@ -210,12 +211,17 @@ impl Transport for SecsGemTransport {
             let origin = connection.origin(&message.header);
             if message.header.wait {
                 let acknowledgement = replied(Arc::clone(&self.open), message.header);
-                arrived.push(Arrived::whole(origin, message.body, acknowledgement));
+                arrived.push(
+                    Arrived::whole(origin, message.body, acknowledgement)
+                        .from_peer(connection.peer()),
+                );
                 *open = Some(connection);
                 return Ok(arrived);
             }
             let acknowledgement = Acknowledgement::at_most_once(AT_MOST_ONCE);
-            arrived.push(Arrived::whole(origin, message.body, acknowledgement));
+            arrived.push(
+                Arrived::whole(origin, message.body, acknowledgement).from_peer(connection.peer()),
+            );
         }
         Ok(arrived)
     }
@@ -344,11 +350,15 @@ impl Accepting for SecsGemTransport {
         // See the Separate.req that follows, so the goodbye is read.
         connection.next_data()?;
         let origin = connection.origin(&message.header);
-        Ok(Taken::new(origin, message.body))
+        Ok(Taken::new(origin, message.body).from_peer(connection.peer()))
     }
 }
 
 impl Loopback for SecsGemTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::PEER
+    }
+
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
