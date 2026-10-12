@@ -192,6 +192,10 @@ impl Transport for SecsGemTransport {
         transport::Arrivals::Ordered("the connection is held by the message waiting for its reply")
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Waits("the accept waits for equipment, the read for its messages")
+    }
+
     /// One equipment's data messages until it separates, or up to the first
     /// primary with the wait bit: from the connection the last receive
     /// stopped on, or one accepted on the listener the first receive bound
