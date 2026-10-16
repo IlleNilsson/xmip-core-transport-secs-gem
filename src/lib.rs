@@ -493,8 +493,7 @@ mod tests {
 
     #[test]
     fn receive_takes_an_equipments_messages_until_it_separates() {
-        let (listener, address) = node().bind().expect("a free port");
-        drop(listener);
+        let address = net::fixture::unheld().to_string();
         let passive = address.clone();
         let receiver = std::thread::spawn(move || {
             SecsGemTransport::new(passive)
