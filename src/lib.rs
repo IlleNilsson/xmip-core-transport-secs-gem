@@ -204,7 +204,7 @@ impl Transport for SecsGemTransport {
     /// stops at it, keeping
     /// the connection for the next. A message without the wait bit is
     /// at-most-once ([`AT_MOST_ONCE`]).
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         let mut connection = match open.take() {
             Some(connection) => connection,
@@ -230,11 +230,16 @@ impl Transport for SecsGemTransport {
         Ok(arrived)
     }
 
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered("one HSMS message carries the whole body")
+    }
+
     /// Connect, select, send one message, take the reply if one is due,
     /// separate. A reply under function 0 — the equipment aborted the
     /// transaction — fails the send as retryable; a reply that is a single
     /// non-zero acknowledge code — not accepted — fails it as permanent.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
         let (address, stream, function, wait) = self.resolve(target)?;
         let mut connection = self.connect(&address)?;
         let reply = connection.send_data(stream, function, wait, bytes)?;

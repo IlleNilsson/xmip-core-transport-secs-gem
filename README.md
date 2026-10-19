@@ -21,6 +21,10 @@ wait bit expects nothing back, so acceptance is at-most-once there. Each
 message arrives whole. A send that is answered `SxF0` fails as retryable; one
 answered a single non-zero acknowledge code fails as permanent.
 
+A receive takes every message a connection carries, whatever room the runtime
+gives it (`Transport::receive_up_to`): one without the wait bit was let go
+of as it was sent, and none can wait at the far end.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
