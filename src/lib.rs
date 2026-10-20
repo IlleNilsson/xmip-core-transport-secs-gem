@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_takes_an_equipments_messages_until_it_separates() {
+    fn receive_takes_the_messages_of_an_equipment_until_it_separates() {
         let address = net::fixture::unheld().to_string();
         let passive = address.clone();
         let receiver = std::thread::spawn(move || {
