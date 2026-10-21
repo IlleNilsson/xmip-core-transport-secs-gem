@@ -11,10 +11,16 @@
 //! with a wait bit that says a reply is expected under the next function
 //! up. A Receive Location is the passive side: it listens, accepts one
 //! equipment's select, and hands each data message up. A Send Location is
-//! the active side: it connects, selects, sends one message as the stream
-//! and function the target names, waits for the reply if the wait bit is
-//! set, and separates. [`Connection`] is either side for a Journey that
-//! must reply, and [`item`] reads and writes the SECS-II bodies.
+//! the active side: it connects and selects once, then sends each message
+//! as the stream and function the target names and waits for the reply if
+//! the wait bit is set, on the session it keeps with the equipment
+//! (`transport::Pool`), separating when the session is let go. A Receive
+//! Location keeps its equipment's sessions beside its listener
+//! (`transport::serving::Serving`), each data message one turn ([`peer`]).
+//! A selected HSMS session is meant to persist; until 2026-10-21 every send
+//! connected, selected and separated of its own. [`Connection`] is either
+//! side for a Journey that must reply, and [`item`] reads and writes the
+//! SECS-II bodies.
 //!
 //! The origin URI carries what the header knew:
 //! `secs-gem://peer?session=1&stream=6&function=11`. A target is
@@ -31,32 +37,33 @@
 //! ACKC6 *1–63 error, not accepted*), so the equipment does not send it
 //! again; [`Verdict::Failed`] replies `SxF0`, the abort SEMI E5 (section
 //! 9.2, function 0) gives a receiver that will not complete the
-//! transaction, so the equipment sends it again. A receive stops at such a
-//! primary and keeps the connection, so the next receive goes on reading it
-//! once the reply is written. A message
+//! transaction, so the equipment sends it again. The session takes no next
+//! message until the reply is written: what the equipment sends meanwhile
+//! waits in its socket. A message
 //! without the wait bit expects nothing back: acceptance is at-most-once
 //! there ([`AT_MOST_ONCE`]). Each message arrives whole.
 
 pub mod connection;
 pub mod hsms;
 pub mod item;
+pub mod peer;
 
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 pub use connection::Connection;
 pub use hsms::{Header, Message, SType};
 pub use item::Item;
 use net::Target;
+pub use peer::Peer;
 use transport::ArrivalIdentity;
 use transport::error::{Result, TransportError, protocol_error};
-use transport::kept::Kept;
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
+use transport::serving::Serving;
 use transport::socket;
-use transport::{Acknowledgement, Taken, Verdict};
 use transport::{Arrived, Configured, Directions, Transport};
+use transport::{Pool, Pooled, Taken};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// The body of the reply to an accepted primary: `<B 0>`, accepted, the
@@ -73,20 +80,17 @@ pub const NOT_ACCEPTED: [u8; 3] = [0x21, 0x01, 0x01];
 pub const AT_MOST_ONCE: &str = "a SECS-II message without the wait bit expects no reply, so the \
                                 equipment is never told how the receive cycle ended";
 
-/// The connection a receive stopped on, its primary waiting for a reply.
-type Open = Arc<Mutex<Option<Connection>>>;
-
 #[derive(Clone)]
 pub struct SecsGemTransport {
     bind: String,
     session_id: u16,
     wait: bool,
     timeout: Option<Duration>,
-    /// The listener the first receive binds, and every receive takes from.
-    receiving: Kept<TcpListener>,
-    /// The connection a receive stopped on at a waiting primary, which the
-    /// verdict replies on and the next receive goes on reading.
-    open: Open,
+    /// The session kept with each equipment, shared by every clone.
+    hosts: Pool<Host>,
+    /// The listener the first receive binds, and the sessions the active
+    /// sides keep open on it between their messages.
+    receiving: Serving<Peer>,
 }
 
 impl SecsGemTransport {
@@ -101,8 +105,8 @@ impl SecsGemTransport {
             session_id: connection::ANY_SESSION,
             wait: false,
             timeout: None,
-            receiving: Kept::new(),
-            open: Open::default(),
+            hosts: Pool::new(),
+            receiving: Serving::new(),
         }
     }
 
@@ -189,61 +193,44 @@ impl Transport for SecsGemTransport {
     }
 
     fn arrivals(&self) -> transport::Arrivals {
-        transport::Arrivals::Ordered("the connection is held by the message waiting for its reply")
+        transport::Arrivals::Ordered("a session takes nothing while a primary waits for its reply")
     }
 
     fn waiting(&self) -> transport::Waiting {
-        transport::Waiting::Waits("the accept waits for equipment, the read for its messages")
+        transport::Waiting::Waits("the listener and the kept sessions wait for a message")
     }
 
-    /// One equipment's data messages until it separates, or up to the first
-    /// primary with the wait bit: from the connection the last receive
-    /// stopped on, or one accepted on the listener the first receive bound
-    /// and kept. A waiting primary is answered after the cycle — `<B 0>` on
-    /// accepted, `<B 1>` on refused, `SxF0` on failed — and the receive
-    /// stops at it, keeping
-    /// the connection for the next. A message without the wait bit is
-    /// at-most-once ([`AT_MOST_ONCE`]).
+    /// One data message, from whichever equipment sends first: one new on
+    /// the listener the first receive bound and kept, selected, or one
+    /// whose session is kept ([`peer`]). A waiting primary is answered
+    /// after the cycle — `<B 0>` on accepted, `<B 1>` on refused, `SxF0` on
+    /// failed — and its session takes nothing more until then. A message
+    /// without the wait bit is at-most-once ([`AT_MOST_ONCE`]).
     fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
-        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut connection = match open.take() {
-            Some(connection) => connection,
-            None => self.accept_one(self.receiving.bound(|| self.bind())?)?,
-        };
-        let mut arrived = Vec::new();
-        while let Some(message) = connection.next_data()? {
-            let origin = connection.origin(&message.header);
-            if message.header.wait {
-                let acknowledgement = replied(Arc::clone(&self.open), message.header);
-                arrived.push(
-                    Arrived::whole(origin, message.body, acknowledgement)
-                        .from_peer(connection.peer()),
-                );
-                *open = Some(connection);
-                return Ok(arrived);
-            }
-            let acknowledgement = Acknowledgement::at_most_once(AT_MOST_ONCE);
-            arrived.push(
-                Arrived::whole(origin, message.body, acknowledgement).from_peer(connection.peer()),
-            );
-        }
-        Ok(arrived)
+        let arrived = self
+            .receiving
+            .next(|| self.bind(), self.timeout, Peer::new, Peer::turn)?;
+        Ok(vec![arrived])
     }
 
     fn sending(&self) -> transport::Sending {
         transport::Sending::Gathered("one HSMS message carries the whole body")
     }
 
-    /// Connect, select, send one message, take the reply if one is due,
-    /// separate. A reply under function 0 — the equipment aborted the
-    /// transaction — fails the send as retryable; a reply that is a single
-    /// non-zero acknowledge code — not accepted — fails it as permanent.
+    /// One message on the session kept with the equipment, or on a new one
+    /// connected and selected for it, and its reply if one is due. A reply
+    /// under function 0 — the equipment aborted the transaction — fails the
+    /// send as retryable; a reply that is a single non-zero acknowledge
+    /// code — not accepted — fails it as permanent. The session is kept
+    /// either way, and separated when it is let go.
     fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
         let bytes: &[u8] = &outgoing.gather()?;
         let (address, stream, function, wait) = self.resolve(target)?;
-        let mut connection = self.connect(&address)?;
-        let reply = connection.send_data(stream, function, wait, bytes)?;
-        connection.separate()?;
+        let reply = self.hosts.exchange(
+            address.as_str(),
+            || Ok(Host(self.connect(&address)?)),
+            |host| host.0.send_data(stream, function, wait, bytes),
+        )?;
         match reply {
             Some(reply) if reply.header.function == 0 => Err(TransportError::retryable(format!(
                 "the equipment aborted S{stream}F{function} with S{stream}F0"
@@ -259,30 +246,22 @@ impl Transport for SecsGemTransport {
     }
 }
 
-/// The reply a waiting primary under `primary` gets once the cycle has
-/// ended, on the connection the receive kept: [`ACCEPTED`] or
-/// [`NOT_ACCEPTED`] under the next function up, or `SxF0`. The connection
-/// goes when the reply cannot be written.
-fn replied(open: Open, primary: Header) -> Acknowledgement {
-    Acknowledgement::deferred(move |verdict| {
-        let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
-        let connection = open
-            .as_mut()
-            .ok_or_else(|| protocol_error("the equipment's connection is gone"))?;
-        let primary_message = Message {
-            header: primary,
-            body: Vec::new(),
-        };
-        let written = match verdict {
-            Verdict::Accepted => connection.reply(&primary_message, &ACCEPTED),
-            Verdict::Refused(_) => connection.reply(&primary_message, &NOT_ACCEPTED),
-            Verdict::Failed => connection.abort(primary),
-        };
-        if written.is_err() {
-            open.take();
-        }
-        written
-    })
+/// A Send Location's selected session with one equipment, kept between its
+/// messages, and separated when it is let go.
+struct Host(Connection);
+
+impl Pooled for Host {
+    /// The equipment speaks here only to reply, so anything it sent to an
+    /// idle session — a linktest, a separate — or its close lets it go.
+    fn usable(&mut self) -> bool {
+        self.0.idle()
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        drop(self.0.separating());
+    }
 }
 
 impl Configured for SecsGemTransport {
@@ -497,13 +476,16 @@ mod tests {
     }
 
     #[test]
-    fn receive_takes_the_messages_of_an_equipment_until_it_separates() {
+    fn every_receive_takes_the_next_message_of_a_kept_session_a_linktest_between() {
+        // Until 2026-10-21 one receive read a session's messages until it
+        // separated, which a session kept between messages never does.
         let address = net::fixture::unheld().to_string();
         let passive = address.clone();
         let receiver = std::thread::spawn(move || {
-            SecsGemTransport::new(passive)
-                .timing_out_after(Duration::from_secs(2))
-                .receive()
+            let receiver = SecsGemTransport::new(passive).timing_out_after(Duration::from_secs(2));
+            let mut arrived = receiver.receive()?;
+            arrived.extend(receiver.receive()?);
+            Ok::<_, TransportError>(arrived)
         });
         let mut connection = None;
         for _ in 0..100 {
@@ -544,8 +526,11 @@ mod tests {
         receiver.receiving.bound(|| receiver.bind()).expect("bound");
         let address = receiver.receiving.address().expect("address");
         let target = format!("secs-gem://{address}?stream=6&function=11&wait=1");
+        // One host, its session kept across a refusal and an abort.
         let host = std::thread::spawn(move || {
-            [b"R1", b"C1", b"C1"].map(|body| node().send(&target, body))
+            let host = node();
+            let sent = [b"R1", b"C1", b"C1"].map(|body| host.send(&target, body));
+            (sent, host.hosts.opened())
         });
         // Refused: S6F12 <B 1>, not accepted, and the send fails for good.
         let mut arrived = receiver.receive().expect("the first");
@@ -555,17 +540,19 @@ mod tests {
             .remove(0)
             .refused(transport::Refusal::Unacceptable)
             .expect("not accepted");
-        // The kept connection goes on: the host separated after its reply.
-        assert!(receiver.receive().expect("separated").is_empty());
         // Failed: the equipment's host is answered S6F0 and sends again.
         let mut arrived = receiver.receive().expect("the second");
         arrived.remove(0).failed().expect("aborted");
-        assert!(receiver.receive().expect("separated").is_empty());
         // Accepted: S6F12 <B 0>, and the send succeeds.
         let mut arrived = receiver.receive().expect("sent again");
         let taken = arrived.remove(0).taken().expect("accepted");
         assert_eq!(taken.bytes, b"C1");
-        let [refused, failed, accepted] = host.join().expect("thread");
+        let ([refused, failed, accepted], opened) = host.join().expect("thread");
+        assert_eq!(
+            opened, 1,
+            "one session, kept across the refusal and the abort"
+        );
+        assert_eq!(receiver.receiving.open(), 1);
         let refused = refused.expect_err("not accepted");
         assert!(
             !refused.retryable && refused.message.contains("code 1"),
@@ -577,6 +564,43 @@ mod tests {
             "{failed}"
         );
         accepted.expect("acknowledged");
+    }
+
+    #[test]
+    fn a_hundred_sends_to_one_equipment_select_one_session_and_every_receive_takes_from_it() {
+        // Until 2026-10-21 every send connected, selected and separated of
+        // its own.
+        const ROUNDS: usize = 100;
+        let receiver = SecsGemTransport::loopback();
+        let address = receiver
+            .receiving
+            .bound(|| receiver.bind())
+            .expect("bound")
+            .to_string();
+        let sender = std::thread::spawn(move || {
+            let sender = SecsGemTransport::loopback();
+            let shared = sender.clone();
+            for round in 0..ROUNDS {
+                let by = if round % 2 == 0 { &sender } else { &shared };
+                // Every other one waits for its reply.
+                let wait = round % 2;
+                let target = format!("secs-gem://{address}?stream=6&function=11&wait={wait}");
+                by.send(&target, format!("e{round}").as_bytes())
+                    .expect("sent");
+            }
+            sender.hosts.opened()
+        });
+        let mut peers = std::collections::BTreeSet::new();
+        for round in 0..ROUNDS {
+            let arrived = receiver.receive().expect("received").remove(0);
+            assert_eq!(arrived.defers(), round % 2 == 1, "round {round}");
+            let taken = arrived.taken().expect("accepted");
+            assert_eq!(taken.bytes, format!("e{round}").as_bytes());
+            peers.insert(taken.origin_uri.split('?').next().map(str::to_string));
+        }
+        assert_eq!(sender.join().expect("sender"), 1, "one session");
+        assert_eq!(peers.len(), 1, "every message on the kept session");
+        assert_eq!(receiver.receiving.open(), 1);
     }
 
     #[test]

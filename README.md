@@ -2,7 +2,9 @@
 
 SECS/GEM transport: HSMS over TCP with select, linktest and separate, SECS-II items encoded and decoded, each data message a Stream addressed by stream and function — the semiconductor equipment interface. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
-A Receive Location keeps its listener, bound on the first receive (`transport::kept::Kept`): a peer that connects between two receives is queued and taken by the next, where until 2026-09-27 each receive bound a listener of its own and a peer between receives was refused.
+A Receive Location keeps its listener, bound on the first receive: a peer that connects between two receives is queued and taken by the next, where until 2026-09-27 each receive bound a listener of its own and a peer between receives was refused.
+
+A selected HSMS session is meant to persist, and both ends keep it. A Send Location connects and selects once per equipment (`transport::Pool`), sends message after message on the session, and separates when the session is let go; a Receive Location keeps its equipment's sessions beside the listener (`transport::serving::Serving`, `src/peer.rs`), the select the first turn on each, a linktest one of its own, and every data message one receive's turn, from whichever equipment sends first. Until 2026-10-21 every send connected, selected and separated of its own, and a receive read one session's messages until it separated.
 
 A send target is read by `net::Target` in [xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net), the one reading of a URI every technology calls, and its query is decoded there. Until 2026-09-28 this technology split the query off itself, without percent-decoding it.
 
@@ -15,15 +17,12 @@ ACKC6, ACKC10, HCACK); on Refused it goes there with `<B 1>`, *error, not
 accepted* (SEMI E5 section 10, the data item dictionary), so the equipment
 does not send it again; on Failed the reply is `SxF0`, the abort SEMI E5
 (section 9.2, function 0) gives a receiver that will not complete the
-transaction, so the equipment sends it again. A receive stops at such a primary and keeps the connection; the next
-receive goes on reading it once the reply is written. A message without the
-wait bit expects nothing back, so acceptance is at-most-once there. Each
-message arrives whole. A send that is answered `SxF0` fails as retryable; one
-answered a single non-zero acknowledge code fails as permanent.
-
-A receive takes every message a connection carries, whatever room the runtime
-gives it (`Transport::receive_up_to`): one without the wait bit was let go
-of as it was sent, and none can wait at the far end.
+transaction, so the equipment sends it again. The session takes no next
+message until the reply is written: what the equipment sends meanwhile waits
+in its socket. A message without the wait bit expects nothing back, so
+acceptance is at-most-once there. Each message arrives whole, one a receive.
+A send that is answered `SxF0` fails as retryable; one answered a single
+non-zero acknowledge code fails as permanent; the session is kept either way.
 
 ## Toolchain
 

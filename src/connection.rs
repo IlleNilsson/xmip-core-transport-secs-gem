@@ -64,21 +64,64 @@ impl Connection {
     /// Select.req.
     pub fn accept(listener: &TcpListener, timeout: Option<Duration>) -> Result<Self> {
         let (stream, peer) = socket::accept_tcp(listener, timeout)?;
-        let mut connection = Self::over(stream, peer, ANY_SESSION)?;
-        match connection.read()? {
+        let mut connection = Self::accepted(stream, peer)?;
+        if !connection.grant_select()? {
+            return Err(protocol_error("the peer closed before Select.req"));
+        }
+        Ok(connection)
+    }
+
+    /// The passive side of a connection an active side opened from `peer`,
+    /// its select not yet read ([`Connection::grant_select`]).
+    ///
+    /// # Errors
+    /// Where the connection could not be cloned for its reads.
+    pub fn accepted(stream: TcpStream, peer: SocketAddr) -> Result<Self> {
+        Self::over(stream, peer, ANY_SESSION)
+    }
+
+    /// Read the active side's Select.req and grant it: `false` where it
+    /// closed before saying anything — a poke, not a peer.
+    ///
+    /// # Errors
+    /// Where the connection did not open with Select.req.
+    pub fn grant_select(&mut self) -> Result<bool> {
+        match self.read()? {
             Some(message) if message.header.stype == SType::SelectReq => {
                 let header = message.header;
-                connection.session_id = header.session_id;
-                connection.write(&control(
+                self.session_id = header.session_id;
+                self.write(&control(
                     header.session_id,
                     SType::SelectRsp,
                     0,
                     header.system,
                 ))?;
+                Ok(true)
             }
-            _ => return Err(protocol_error("the peer did not open with Select.req")),
+            None => Ok(false),
+            Some(_) => Err(protocol_error("the peer did not open with Select.req")),
         }
-        Ok(connection)
+    }
+
+    /// The socket the connection is, for its readiness and for an answer
+    /// written from elsewhere (`transport::answer::Answer`).
+    #[must_use]
+    pub const fn socket(&self) -> &TcpStream {
+        &self.writer
+    }
+
+    /// Whether a message already read waits in this side's buffer.
+    #[must_use]
+    pub fn buffered(&self) -> bool {
+        !self.reader.buffer().is_empty()
+    }
+
+    /// Whether the peer still holds the connection open and has sent
+    /// nothing since it was last read: what an idle active side must be to
+    /// carry the next message.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        !self.buffered() && transport::pool::quiet(&self.writer)
     }
 
     fn over(stream: TcpStream, peer: SocketAddr, session_id: u16) -> Result<Self> {
@@ -148,27 +191,15 @@ impl Connection {
     /// # Errors
     /// Where the peer went away.
     pub fn reply(&mut self, primary: &Message, body: &[u8]) -> Result<()> {
-        self.write(&Message {
-            header: primary.header.reply(),
-            body: body.to_vec(),
-        })
+        self.write(&reply_to(primary.header, body))
     }
 
-    /// Abort the transaction `primary` opened: `SxF0`, header only, the
-    /// same system bytes — SEMI E5's answer from a receiver that will not
-    /// complete it.
+    /// Abort the transaction `primary` opened ([`abort_of`]).
     ///
     /// # Errors
     /// Where the peer went away.
     pub fn abort(&mut self, primary: Header) -> Result<()> {
-        self.write(&Message {
-            header: Header {
-                wait: false,
-                function: 0,
-                ..primary
-            },
-            body: Vec::new(),
-        })
+        self.write(&abort_of(primary))
     }
 
     /// The next data message, or `None` when the peer separated, deselected
@@ -178,41 +209,39 @@ impl Connection {
     /// Where the connection broke, or the peer sent what is not HSMS.
     pub fn next_data(&mut self) -> Result<Option<Message>> {
         loop {
-            let Some(message) = self.read()? else {
-                return Ok(None);
-            };
-            let header = message.header;
-            match header.stype {
-                SType::Data => return Ok(Some(message)),
-                SType::LinktestReq => {
-                    self.write(&control(
-                        header.session_id,
-                        SType::LinktestRsp,
-                        0,
-                        header.system,
-                    ))?;
-                }
-                SType::DeselectReq => {
-                    self.write(&control(
-                        header.session_id,
-                        SType::DeselectRsp,
-                        0,
-                        header.system,
-                    ))?;
-                    return Ok(None);
-                }
-                SType::SeparateReq => return Ok(None),
-                SType::SelectReq => {
-                    self.write(&control(
-                        header.session_id,
-                        SType::SelectRsp,
-                        1,
-                        header.system,
-                    ))?;
-                }
-                SType::LinktestRsp | SType::SelectRsp | SType::DeselectRsp | SType::RejectReq => {}
+            match self.step()? {
+                Step::Data(message) => return Ok(Some(message)),
+                Step::Answered => {}
+                Step::Ended => return Ok(None),
             }
         }
+    }
+
+    /// The next message, one: a data message, a control message answered
+    /// on the way, or the session's end — the peer separated, deselected
+    /// or closed. What a kept connection reads one turn at a time, so a
+    /// linktest on it never waits for the data after.
+    ///
+    /// # Errors
+    /// Where the connection broke, or the peer sent what is not HSMS.
+    pub fn step(&mut self) -> Result<Step> {
+        let Some(message) = self.read()? else {
+            return Ok(Step::Ended);
+        };
+        let header = message.header;
+        let answer = |stype, status| control(header.session_id, stype, status, header.system);
+        match header.stype {
+            SType::Data => return Ok(Step::Data(message)),
+            SType::LinktestReq => self.write(&answer(SType::LinktestRsp, 0))?,
+            SType::DeselectReq => {
+                self.write(&answer(SType::DeselectRsp, 0))?;
+                return Ok(Step::Ended);
+            }
+            SType::SeparateReq => return Ok(Step::Ended),
+            SType::SelectReq => self.write(&answer(SType::SelectRsp, 1))?,
+            SType::LinktestRsp | SType::SelectRsp | SType::DeselectRsp | SType::RejectReq => {}
+        }
+        Ok(Step::Answered)
     }
 
     /// Ask whether the peer is still there, and wait for it to say so.
@@ -245,6 +274,15 @@ impl Connection {
     /// # Errors
     /// Where the peer had already gone.
     pub fn separate(mut self) -> Result<()> {
+        self.separating()
+    }
+
+    /// Say Separate.req, the connection left to whoever holds it: what a
+    /// session kept between messages says when it is let go.
+    ///
+    /// # Errors
+    /// Where the peer had already gone.
+    pub fn separating(&mut self) -> Result<()> {
         let system = self.system();
         self.write(&control(self.session_id, SType::SeparateReq, 0, system))
     }
@@ -260,6 +298,41 @@ impl Connection {
 
     fn read(&mut self) -> Result<Option<Message>> {
         hsms::read_message(&mut self.reader)
+    }
+}
+
+/// What one message read came to ([`Connection::step`]).
+#[derive(Debug)]
+pub enum Step {
+    /// A data message.
+    Data(Message),
+    /// A control message, answered where it asks for an answer.
+    Answered,
+    /// The peer separated, deselected or closed.
+    Ended,
+}
+
+/// The reply to `primary` with `body`, under the next function up.
+#[must_use]
+pub fn reply_to(primary: Header, body: &[u8]) -> Message {
+    Message {
+        header: primary.reply(),
+        body: body.to_vec(),
+    }
+}
+
+/// The abort of the transaction `primary` opened: `SxF0`, header only, the
+/// same system bytes — SEMI E5's answer from a receiver that will not
+/// complete it.
+#[must_use]
+pub const fn abort_of(primary: Header) -> Message {
+    Message {
+        header: Header {
+            wait: false,
+            function: 0,
+            ..primary
+        },
+        body: Vec::new(),
     }
 }
 
