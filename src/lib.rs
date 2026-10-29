@@ -164,7 +164,7 @@ impl SecsGemTransport {
     /// # Errors
     /// A stream, function or wait in the query that is not a number.
     pub fn resolve(&self, target: &str) -> Result<(String, u8, u8, bool)> {
-        let Some(named) = Target::under(&["secs-gem"], target) else {
+        let Some(named) = Target::under(Self::SCHEMES, target) else {
             return Ok((target.to_string(), 6, 11, self.wait));
         };
         let (mut stream, mut function, mut wait) = (6u8, 11u8, self.wait);
@@ -298,6 +298,9 @@ impl Configured for SecsGemTransport {
             },
         ],
     };
+
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["secs-gem"];
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let mut transport = Self::new(address);
