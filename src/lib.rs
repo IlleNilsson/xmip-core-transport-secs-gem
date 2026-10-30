@@ -19,7 +19,7 @@
 //! (`transport::serving::Serving`), each data message one turn ([`peer`]).
 //! A selected HSMS session is meant to persist; until 2026-10-21 every send
 //! connected, selected and separated of its own. [`Connection`] is either
-//! side for a Journey that must reply, and [`item`] reads and writes the
+//! side for a Message that must be answered, and [`item`] reads and writes the
 //! SECS-II bodies.
 //!
 //! The origin URI carries what the header knew:
