@@ -43,9 +43,6 @@ const U1: u8 = 0o51;
 const U2: u8 = 0o52;
 const U4: u8 = 0o54;
 
-/// How deep a list may nest before it is refused as hostile.
-const MAX_DEPTH: usize = 64;
-
 /// `item` as bytes on the wire.
 #[must_use]
 pub fn encode(item: &Item) -> Vec<u8> {
@@ -121,9 +118,7 @@ pub fn decode(bytes: &[u8]) -> Result<Item> {
 }
 
 fn decode_at(bytes: &[u8], at: &mut usize, depth: usize) -> Result<Item> {
-    if depth > MAX_DEPTH {
-        return Err(protocol_error("a list nested past what is reasonable"));
-    }
+    codec::depth::within(depth, "a SECS-II item").map_err(|deep| protocol_error(deep.message))?;
     let format_byte = *bytes
         .get(*at)
         .ok_or_else(|| protocol_error("an item cut off at its format byte"))?;
@@ -234,8 +229,18 @@ mod tests {
         assert!(decode(&[0o77 << 2 | 1, 0]).is_err(), "no such format");
         assert!(decode(&[1, 1]).is_err(), "a list of one, empty");
         assert!(decode(&[0o51 << 2 | 1, 1, 9, 9]).is_err(), "left over");
-        let mut deep = [1, 1].repeat(70);
-        deep.extend_from_slice(&[1, 0]);
-        assert!(!decode(&deep).expect_err("too deep").retryable);
+    }
+
+    #[test]
+    fn a_list_is_read_to_the_estates_one_depth_and_refused_past_it() {
+        // Lists of one, nested `levels` deep, around an empty list.
+        let nested = |levels: usize| [[1, 1].repeat(levels), vec![1, 0]].concat();
+        decode(&nested(codec::depth::MAX_DEPTH)).expect("the last level");
+        let refused = decode(&nested(codec::depth::MAX_DEPTH + 1)).expect_err("too deep");
+        assert!(!refused.retryable);
+        assert_eq!(
+            refused.message,
+            "a SECS-II item nests past the 64 levels Xmip reads"
+        );
     }
 }
