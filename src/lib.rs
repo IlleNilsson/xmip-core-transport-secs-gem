@@ -322,6 +322,12 @@ impl Configured for SecsGemTransport {
         }
         Ok(transport)
     }
+
+    /// Each active side's turn on a Receive Location taking at most `turn`.
+    fn turning_within(mut self, turn: Duration) -> Self {
+        self.receiving = self.receiving.turning_within(turn);
+        self
+    }
 }
 
 impl SecsGemTransport {
