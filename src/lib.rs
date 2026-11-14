@@ -192,6 +192,11 @@ impl Transport for SecsGemTransport {
         Directions::BOTH
     }
 
+    /// The callers turned away at their own connection (`transport::serving`).
+    fn turned_away(&self) -> transport::Turned {
+        self.receiving.turned_away()
+    }
+
     fn arrivals(&self) -> transport::Arrivals {
         transport::Arrivals::Ordered("a session takes nothing while a primary waits for its reply")
     }
