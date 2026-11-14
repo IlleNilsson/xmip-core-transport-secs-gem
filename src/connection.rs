@@ -11,6 +11,7 @@ use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
+use transport::deadline::Within;
 use transport::error::{Result, protocol_error};
 use transport::socket;
 
@@ -19,9 +20,10 @@ use crate::hsms::{self, Header, Message, SType};
 /// The session id a select is made under when the equipment has not said.
 pub const ANY_SESSION: u16 = 0xFFFF;
 
-/// A selected HSMS connection, either side.
+/// A selected HSMS connection, either side: read within each turn where a
+/// Receive Location serves it, as its socket says where none does.
 pub struct Connection {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<Within>,
     writer: TcpStream,
     peer: SocketAddr,
     session_id: u16,
@@ -39,7 +41,7 @@ impl Connection {
         let peer = stream
             .peer_addr()
             .map_err(|e| transport::error::classify("reading the peer address", &e))?;
-        let mut connection = Self::over(stream, peer, session_id)?;
+        let mut connection = Self::over(Within::new(stream), peer, session_id)?;
         let system = connection.system();
         connection.write(&control(session_id, SType::SelectReq, 0, system))?;
         match connection.read()? {
@@ -64,7 +66,7 @@ impl Connection {
     /// Select.req.
     pub fn accept(listener: &TcpListener, timeout: Option<Duration>) -> Result<Self> {
         let (stream, peer) = socket::accept_tcp(listener, timeout)?;
-        let mut connection = Self::accepted(stream, peer)?;
+        let mut connection = Self::accepted(Within::new(stream), peer)?;
         if !connection.grant_select()? {
             return Err(protocol_error("the peer closed before Select.req"));
         }
@@ -76,7 +78,7 @@ impl Connection {
     ///
     /// # Errors
     /// Where the connection could not be cloned for its reads.
-    pub fn accepted(stream: TcpStream, peer: SocketAddr) -> Result<Self> {
+    pub fn accepted(stream: Within, peer: SocketAddr) -> Result<Self> {
         Self::over(stream, peer, ANY_SESSION)
     }
 
@@ -124,8 +126,8 @@ impl Connection {
         !self.buffered() && transport::pool::quiet(&self.writer)
     }
 
-    fn over(stream: TcpStream, peer: SocketAddr, session_id: u16) -> Result<Self> {
-        let (reader, writer) = socket::split(stream)?;
+    fn over(stream: Within, peer: SocketAddr, session_id: u16) -> Result<Self> {
+        let (reader, writer) = stream.split()?;
         Ok(Self {
             reader,
             writer,

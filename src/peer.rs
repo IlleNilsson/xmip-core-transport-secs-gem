@@ -14,6 +14,7 @@
 use std::net::{SocketAddr, TcpStream};
 
 use transport::answer::{Answer, Busy};
+use transport::deadline::Within;
 use transport::error::Result;
 use transport::serving::{Open, Turn};
 use transport::{Acknowledgement, Arrived, Verdict};
@@ -34,7 +35,7 @@ impl Peer {
     ///
     /// # Errors
     /// Where the connection could not be cloned for its reads.
-    pub fn new(stream: TcpStream, peer: SocketAddr) -> Result<Self> {
+    pub fn new(stream: Within, peer: SocketAddr) -> Result<Self> {
         Ok(Self {
             connection: Connection::accepted(stream, peer)?,
             selected: false,
