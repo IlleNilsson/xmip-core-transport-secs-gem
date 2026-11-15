@@ -125,13 +125,6 @@ impl SecsGemTransport {
         self
     }
 
-    /// Give up on a peer that stops mid-message or never replies.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
     /// Bind the listener and report the address actually assigned.
     ///
     /// # Errors
@@ -293,19 +286,21 @@ impl Configured for SecsGemTransport {
                           target says `wait=0`; no reply is waited for when left out.",
                 applies: Applies::Send,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a peer that stops mid-message or never replies is waited on; \
-                          unbounded when left out.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                None,
+                "How long a peer that stops mid-message or never replies is waited on; \
+                 unbounded when left out.",
+            ),
         ],
     };
 
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["secs-gem"];
+
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
+    }
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let mut transport = Self::new(address);
@@ -316,9 +311,6 @@ impl Configured for SecsGemTransport {
         }
         if settings.optional_boolean("wait") == Some(true) {
             transport = transport.awaiting_reply();
-        }
-        if let Some(timeout) = settings.optional_duration("timeout") {
-            transport = transport.timing_out_after(timeout);
         }
         Ok(transport)
     }
