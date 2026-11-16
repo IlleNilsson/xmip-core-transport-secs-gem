@@ -2,7 +2,7 @@
 
 SECS/GEM transport: HSMS over TCP with select, linktest and separate, SECS-II items encoded and decoded, each data message a Stream addressed by stream and function — the semiconductor equipment interface. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
-A Receive Location keeps its listener, bound on the first receive: a peer that connects between two receives is queued and taken by the next, where until 2026-09-27 each receive bound a listener of its own and a peer between receives was refused.
+A Receive Location keeps its listener, bound as its transport is opened (`Configured::listening`; on its first receive until 2026-11-16): a peer that connects between two receives is queued and taken by the next, where until 2026-09-27 each receive bound a listener of its own and a peer between receives was refused.
 
 A selected HSMS session is meant to persist, and both ends keep it. A Send Location connects and selects once per equipment (`transport::Pool`), sends message after message on the session, and separates when the session is let go; a Receive Location keeps its equipment's sessions beside the listener (`transport::serving::Serving`, `src/peer.rs`), the select the first turn on each, a linktest one of its own, and every data message one receive's turn, from whichever equipment sends first. Until 2026-10-21 every send connected, selected and separated of its own, and a receive read one session's messages until it separated.
 
