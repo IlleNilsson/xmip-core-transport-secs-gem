@@ -88,7 +88,7 @@ pub struct SecsGemTransport {
     timeout: Option<Duration>,
     /// The session kept with each equipment, shared by every clone.
     hosts: Pool<Host>,
-    /// The listener the first receive binds, and the sessions the active
+    /// The listener its open binds, and the sessions the active
     /// sides keep open on it between their messages.
     receiving: Serving<Peer>,
 }
@@ -199,15 +199,13 @@ impl Transport for SecsGemTransport {
     }
 
     /// One data message, from whichever equipment sends first: one new on
-    /// the listener the first receive bound and kept, selected, or one
+    /// the listener its open bound and kept, selected, or one
     /// whose session is kept ([`peer`]). A waiting primary is answered
     /// after the cycle — `<B 0>` on accepted, `<B 1>` on refused, `SxF0` on
     /// failed — and its session takes nothing more until then. A message
     /// without the wait bit is at-most-once ([`AT_MOST_ONCE`]).
     fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
-        let arrived = self
-            .receiving
-            .next(|| self.bind(), self.timeout, Peer::new, Peer::turn)?;
+        let arrived = self.receiving.next(self.timeout, Peer::new, Peer::turn)?;
         Ok(vec![arrived])
     }
 
@@ -325,6 +323,12 @@ impl Configured for SecsGemTransport {
     fn timed_by(mut self, clock: &std::sync::Arc<dyn xcore::Clock>) -> Self {
         self.receiving = self.receiving.timed_by(clock);
         self
+    }
+
+    /// The listener every receive takes from, bound where a Receive
+    /// Location listens, passive, for the active entity.
+    fn listening(&self) -> Result<Option<&str>> {
+        self.receiving.bound(|| self.bind()).map(Some)
     }
 }
 
@@ -491,23 +495,21 @@ mod tests {
     fn every_receive_takes_the_next_message_of_a_kept_session_a_linktest_between() {
         // Until 2026-10-21 one receive read a session's messages until it
         // separated, which a session kept between messages never does.
+        // The passive entity listens once opened, and the equipment
+        // connects once (the owner, 2026-11-16, *Bind at open*).
         let address = net::fixture::unheld().to_string();
-        let passive = address.clone();
+        let receiver =
+            SecsGemTransport::new(address.clone()).timing_out_after(Duration::from_secs(2));
+        receiver.listening().expect("listens");
         let receiver = std::thread::spawn(move || {
-            let receiver = SecsGemTransport::new(passive).timing_out_after(Duration::from_secs(2));
             let mut arrived = receiver.receive()?;
             arrived.extend(receiver.receive()?);
             Ok::<_, TransportError>(arrived)
         });
-        let mut connection = None;
-        for _ in 0..100 {
-            if let Ok(open) = node().with_session(7).connect(&address) {
-                connection = Some(open);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let mut equipment = connection.expect("the receiver came up");
+        let mut equipment = node()
+            .with_session(7)
+            .connect(&address)
+            .expect("taken on its first connect");
         equipment.send_data(6, 11, false, b"first").expect("first");
         equipment.linktest().expect("linktest");
         equipment.send_data(5, 1, false, b"alarm").expect("second");
