@@ -42,44 +42,75 @@
 //! waits in its socket. A message
 //! without the wait bit expects nothing back: acceptance is at-most-once
 //! there ([`AT_MOST_ONCE`]). Each message arrives whole.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod connection;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod hsms;
+#[cfg(feature = "default")]
 pub mod item;
+#[cfg(feature = "default")]
 pub mod peer;
 
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
+#[cfg(feature = "default")]
 pub use connection::Connection;
+#[cfg(feature = "default")]
 pub use hsms::{Header, Message, SType};
+#[cfg(feature = "default")]
 pub use item::Item;
+#[cfg(feature = "default")]
 use net::Target;
+#[cfg(feature = "default")]
 pub use peer::Peer;
+#[cfg(feature = "default")]
 use transport::ArrivalIdentity;
+#[cfg(feature = "default")]
 use transport::error::{Result, TransportError, protocol_error};
+#[cfg(feature = "default")]
 use transport::listening::{Accepting, Listening};
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
+#[cfg(feature = "default")]
 use transport::serving::Serving;
+#[cfg(feature = "default")]
 use transport::socket;
+#[cfg(feature = "default")]
 use transport::{Arrived, Configured, Directions, Transport};
+#[cfg(feature = "default")]
 use transport::{Pool, Pooled, Taken};
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+#[cfg(feature = "default")]
+use xcore::settings::{Read, Settings};
 
 /// The body of the reply to an accepted primary: `<B 0>`, accepted, the
 /// code ACKC5, ACKC6, ACKC10, HCACK and the other acknowledge items share.
+#[cfg(feature = "default")]
 pub const ACCEPTED: [u8; 3] = [0x21, 0x01, 0x00];
 
 /// The body of the reply to a refused primary: `<B 1>`, error, not
 /// accepted, the first of the codes 1–63 the acknowledge items give a
 /// message the receiver will not take.
+#[cfg(feature = "default")]
 pub const NOT_ACCEPTED: [u8; 3] = [0x21, 0x01, 0x01];
 
 /// Why a message without the wait bit cannot be acknowledged after the
 /// receive cycle.
+#[cfg(feature = "default")]
 pub const AT_MOST_ONCE: &str = "a SECS-II message without the wait bit expects no reply, so the \
                                 equipment is never told how the receive cycle ended";
 
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct SecsGemTransport {
     bind: String,
@@ -93,6 +124,7 @@ pub struct SecsGemTransport {
     receiving: Serving<Peer>,
 }
 
+#[cfg(feature = "default")]
 impl SecsGemTransport {
     /// Listen at `bind`; `0.0.0.0:5000` is the conventional port. Selects
     /// are made under session id 0xFFFF until [`Self::with_session`] says
@@ -102,7 +134,7 @@ impl SecsGemTransport {
     pub fn new(bind: impl Into<String>) -> Self {
         Self {
             bind: bind.into(),
-            session_id: connection::ANY_SESSION,
+            session_id: declaration::ANY_SESSION,
             wait: false,
             timeout: None,
             hosts: Pool::new(),
@@ -176,6 +208,7 @@ impl SecsGemTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for SecsGemTransport {
     fn name(&self) -> &'static str {
         "secs-gem"
@@ -244,8 +277,10 @@ impl Transport for SecsGemTransport {
 
 /// A Send Location's selected session with one equipment, kept between its
 /// messages, and separated when it is let go.
+#[cfg(feature = "default")]
 struct Host(Connection);
 
+#[cfg(feature = "default")]
 impl Pooled for Host {
     /// The equipment speaks here only to reply, so anything it sent to an
     /// idle session — a linktest, a separate — or its close lets it go.
@@ -254,47 +289,17 @@ impl Pooled for Host {
     }
 }
 
+#[cfg(feature = "default")]
 impl Drop for Host {
     fn drop(&mut self) {
         drop(self.0.separating());
     }
 }
 
+#[cfg(feature = "default")]
 impl Configured for SecsGemTransport {
-    /// The address is where a Receive Location listens as the passive side,
-    /// `0.0.0.0:5000`; a Send Location's target is each send's own.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "session",
-                kind: Kind::Integer {
-                    minimum: 0,
-                    maximum: 65_535,
-                },
-                presence: Presence::Default(Fixed::Integer(connection::ANY_SESSION as i64)),
-                meaning: "The session id, the device id, a Send Location selects under.",
-                applies: Applies::Send,
-            },
-            Setting {
-                name: "wait",
-                kind: Kind::Boolean,
-                presence: Presence::Optional,
-                meaning: "Whether what is sent sets the wait bit and takes the reply, unless the \
-                          target says `wait=0`; no reply is waited for when left out.",
-                applies: Applies::Send,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                None,
-                "How long a peer that stops mid-message or never replies is waited on; \
-                 unbounded when left out.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["secs-gem"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
         Some(&mut self.timeout)
@@ -332,6 +337,7 @@ impl Configured for SecsGemTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl SecsGemTransport {
     /// Both ends on this machine: an ephemeral local port for the passive
     /// side, the loopback timeout on every read. The near end sends the
@@ -342,6 +348,7 @@ impl SecsGemTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Accepting for SecsGemTransport {
     fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut connection = self.accept_one(listener)?;
@@ -358,6 +365,7 @@ impl Accepting for SecsGemTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for SecsGemTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::PEER
@@ -396,7 +404,7 @@ mod tests {
 
     #[test]
     fn secs_gem_declares_its_settings_and_reads_through_them() {
-        use xcore::settings::Given;
+        use xcore::settings::{Applies, Given};
         assert_eq!(SecsGemTransport::SETTINGS.problems(), Vec::<String>::new());
         let given = [
             ("session".to_string(), Given::Integer(7)),
@@ -408,7 +416,7 @@ mod tests {
         assert!(built.wait);
         assert_eq!(built.timeout, Some(Duration::from_secs(2)));
         let plain = SecsGemTransport::open("0.0.0.0:0", Applies::Send, &[]).expect("plain");
-        assert_eq!(plain.session_id, connection::ANY_SESSION);
+        assert_eq!(plain.session_id, declaration::ANY_SESSION);
         assert!(!plain.wait);
         let Err(refused) = SecsGemTransport::open("0.0.0.0:0", Applies::Receive, &given) else {
             panic!("a Receive Location selects nothing");

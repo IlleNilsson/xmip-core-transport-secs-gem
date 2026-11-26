@@ -15,10 +15,8 @@ use transport::deadline::Within;
 use transport::error::{Result, protocol_error};
 use transport::socket;
 
+use crate::declaration::ANY_SESSION;
 use crate::hsms::{self, Header, Message, SType};
-
-/// The session id a select is made under when the equipment has not said.
-pub const ANY_SESSION: u16 = 0xFFFF;
 
 /// A selected HSMS connection, either side: read within each turn where a
 /// Receive Location serves it, as its socket says where none does.
